@@ -52,6 +52,19 @@ import { Payments } from "razorpay/dist/types/payments";
 import { Customers } from "razorpay/dist/types/customers";
 import { Refunds } from "razorpay/dist/types/refunds";
 
+
+// type RazorpayPayment = {
+//   id: string;
+//   amount: number;
+//   currency: string;
+//   status: string;
+// };
+
+interface RazorpaySessionData {
+  id: string;
+}
+
+
 abstract class RazorpayBase extends AbstractPaymentProvider {
   static identifier = "razorpay";
   protected readonly options_: RazorpayProviderConfig & Options;
@@ -392,6 +405,8 @@ abstract class RazorpayBase extends AbstractPaymentProvider {
   async initiatePayment(
     input: InitiatePaymentInput
   ): Promise<InitiatePaymentOutput> {
+    this.logger.info(`[Razorpay] initiatePayment called with input: ${JSON.stringify(input)}`);
+
     const intentRequestData = this.getPaymentIntentOptions();
 
     const { currency_code, amount } = input;
@@ -493,6 +508,10 @@ abstract class RazorpayBase extends AbstractPaymentProvider {
         session_data = await this.razorpay_.orders.create({
           ...intentRequest,
         });
+
+        this.logger.info(
+          `Razorpay order created: ${JSON.stringify(session_data)}`
+        );
       } catch (e) {
         new MedusaError(
           MedusaError.Types.INVALID_DATA,
@@ -507,61 +526,157 @@ abstract class RazorpayBase extends AbstractPaymentProvider {
         MedusaError.Codes.UNKNOWN_MODULES
       );
     }
+
+    this.logger.info(`[Razorpay] Returning payment session: ${JSON.stringify({
+      id: session_data?.id,
+      data: { ...session_data, intentRequest }
+    })}`);
+    
     return {
       id: session_data?.id,
       data: { ...session_data, intentRequest: intentRequest },
     };
   }
 
+
   async authorizePayment(
     input: AuthorizePaymentInput
   ): Promise<AuthorizePaymentOutput> {
-    const status = await this.getPaymentStatus(input);
-    return {
-      status: status.status,
-      data: {
-        ...status,
-        intentRequest: input,
-      },
-    };
+    this.logger.info(`[Razorpay] authorizePayment input: ${JSON.stringify(input)}`);
+  
+    // 1. Extract orderId
+    const orderId = typeof input.data?.id === "string" ? input.data.id : undefined;
+    if (!orderId) {
+      this.logger.error("[Razorpay] authorizePayment failed: order_id is missing or not a string in session data.");
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "Razorpay order_id is missing or not a string in payment session data."
+      );
+    }
+    this.logger.info(`[Razorpay] Using order_id: ${orderId}`);
+  
+    // 2. Fetch and log the order (optional, for context)
+    let razorpayOrder;
+    try {
+      razorpayOrder = await this.razorpay_.orders.fetch(orderId);
+      this.logger.info(`[Razorpay] Fetched order: ${JSON.stringify(razorpayOrder)}`);
+    } catch (err) {
+      this.logger.error(`[Razorpay] Error fetching order from Razorpay: ${err?.message || err}`);
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "Failed to fetch order from Razorpay."
+      );
+    }
+  
+    // 3. Fetch and log payments for this order
+    let payments;
+    try {
+      payments = await this.razorpay_.orders.fetchPayments(orderId);
+      this.logger.info(`[Razorpay] Payments for order ${orderId}: ${JSON.stringify(payments)}`);
+      payments.items.forEach((payment: any) => {
+        this.logger.info(`[Razorpay] Payment ID: ${payment.id}, Status: ${payment.status}`);
+      });
+    } catch (err) {
+      this.logger.error(`[Razorpay] Error fetching payments for order ${orderId}: ${err?.message || err}`);
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "Failed to fetch payments for order from Razorpay."
+      );
+    }
+  
+    // 4. Check if any payment is authorized or captured
+    const authorizedPayment = payments.items.find(
+      (p: any) => p.status === "authorized" || p.status === "captured"
+    );
+  
+    if (authorizedPayment) {
+      this.logger.info(`[Razorpay] Found authorized/captured payment: ${authorizedPayment.id}`);
+      return {
+        status: "authorized",
+        data: {
+          ...razorpayOrder,
+          payment: authorizedPayment,
+          order_id: orderId,
+        },
+      };
+    } else {
+      this.logger.warn(`[Razorpay] No authorized or captured payment found for order ${orderId}.`);
+      return {
+        status: "pending",
+        data: {
+          ...razorpayOrder,
+          payments: payments.items,
+          reason: "No authorized/captured payment yet. Check logs for payment status.",
+        },
+      };
+    }
   }
-  async capturePayment(
-    paymentSessionData: CapturePaymentInput
-  ): Promise<CapturePaymentOutput> {
-    const order_id = (paymentSessionData?.data as any)?.data?.id;
+  
 
-    const paymentsResponse = await this.razorpay_.orders.fetchPayments(
-      order_id
-    );
+  async capturePayment(
+    input: CapturePaymentInput
+  ): Promise<CapturePaymentOutput> {
+    this.logger.info(`[Razorpay] capturePayment input: ${JSON.stringify(input)}`);
+  
+    // Type guard to check if input.data is RazorpaySessionData
+    function isRazorpaySessionData(data: unknown): data is RazorpaySessionData {
+      return (
+        typeof data === "object" &&
+        data !== null &&
+        "id" in data &&
+        typeof (data as any).id === "string"
+      );
+    }
+  
+    if (!isRazorpaySessionData(input.data)) {
+      this.logger.error("[Razorpay] capturePayment failed: order_id is missing or data is not valid RazorpaySessionData.");
+      throw new Error("Razorpay order_id is missing in payment session data.");
+    }
+  
+    const order_id = input.data.id;
+    this.logger.info(`[Razorpay] Using order_id: ${order_id}`);
+  
+    // ...rest of your logic, using input.data as RazorpaySessionData
+    const paymentsResponse = await this.razorpay_.orders.fetchPayments(order_id);
+    this.logger.info(`[Razorpay] Payments for order ${order_id}: ${JSON.stringify(paymentsResponse.items)}`);
+  
     const possibleCaptures = paymentsResponse.items?.filter(
-      (item) => item.status == "authorized"
+      (item: any) => item.status === "authorized"
     );
-    const result = possibleCaptures?.map(async (payment) => {
+  
+    if (!possibleCaptures || possibleCaptures.length === 0) {
+      this.logger.error(`[Razorpay] No authorized payments found for order ${order_id}`);
+      throw new Error("No authorized payments to capture.");
+    }
+  
+    const payments: any[] = [];
+    for (const payment of possibleCaptures) {
       const { id, amount, currency } = payment;
-      const toPay =
-        getAmountFromSmallestUnit(
-          Math.round(parseInt(amount.toString())),
-          currency.toUpperCase()
-        ) * 100;
+      const toPay = getAmountFromSmallestUnit(
+        Math.round(parseInt(amount.toString())),
+        currency.toUpperCase()
+      ) * 100;
+      this.logger.info(`[Razorpay] Capturing payment ${id} for amount ${toPay} ${currency}`);
       const paymentIntent = await this.razorpay_.payments.capture(
         id,
         toPay,
         currency as string
       );
-      return paymentIntent;
-    });
-    if (result) {
-      const payments = await Promise.all(result);
-      const res = payments.reduce(
-        (acc, curr) => ((acc[curr.id] = curr), acc),
-        {}
-      );
-      (paymentSessionData as unknown as Orders.RazorpayOrder).payments = res;
+      this.logger.info(`[Razorpay] Payment captured: ${JSON.stringify(paymentIntent)}`);
+      payments.push(paymentIntent);
     }
+  
+    (input as any).payments = payments;
+  
     return {
-      data: { ...paymentSessionData, intentRequest: paymentSessionData },
+      data: { ...input, intentRequest: input },
     };
   }
+  
+  
+  
+  
+  
 
   async getPaymentStatus(
     paymentSessionData: GetPaymentStatusInput
@@ -656,6 +771,8 @@ abstract class RazorpayBase extends AbstractPaymentProvider {
     };
   }
   async refundPayment(input: RefundPaymentInput): Promise<RefundPaymentOutput> {
+    this.logger.info(`[Razorpay] refundPayment called with input: ${JSON.stringify(input)}`);
+
     const { data, amount } = input;
 
     const id = (data as unknown as Orders.RazorpayOrder).id as string;
@@ -685,6 +802,8 @@ abstract class RazorpayBase extends AbstractPaymentProvider {
             data.refundSessions = [refundSession];
           }
         }
+        this.logger.info(`[Razorpay] Refund issued: ${JSON.stringify(refundSession)}`);
+
       } catch (e) {
         new MedusaError(
           MedusaError.Types.INVALID_DATA,
@@ -693,6 +812,7 @@ abstract class RazorpayBase extends AbstractPaymentProvider {
         );
       }
     }
+    
     return { data };
   }
   async retrievePayment(

@@ -8685,7 +8685,7 @@ raw-body@2.5.2:
     iconv-lite "0.4.24"
     unpipe "1.0.0"
 
-razorpay@^2.9.6:
+razorpay@2.9.6:
   version "2.9.6"
   resolved "https://registry.yarnpkg.com/razorpay/-/razorpay-2.9.6.tgz#475bc8b80851e7d153685af218279ed1d3aa649f"
   integrity sha512-zsHAQzd6e1Cc6BNoCNZQaf65ElL6O6yw0wulxmoG5VQDr363fZC90Mp1V5EktVzG45yPyNomNXWlf4cQ3622gQ==
